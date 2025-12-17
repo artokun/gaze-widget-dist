@@ -33,6 +33,105 @@ const widgetLog = (level, msg) => {
 // Generate unique instance IDs for widgets
 let widgetInstanceCounter = 0;
 
+// ============================================================================
+// SHARED RENDERER MANAGER
+// All gaze-tracker widgets share a single WebGL context to avoid browser limits
+// ============================================================================
+const GazeRendererManager = {
+    renderer: null,
+    rendererPromise: null,
+    initQueue: [],
+    isProcessingQueue: false,
+    activeWidgets: new Set(),
+
+    // Get or create the shared renderer
+    async getRenderer() {
+        // If renderer exists and is valid, return it
+        if (this.renderer && !this.renderer.destroyed) {
+            return this.renderer;
+        }
+
+        // If already creating, wait for it
+        if (this.rendererPromise) {
+            return this.rendererPromise;
+        }
+
+        // Create new shared renderer
+        this.rendererPromise = this._createRenderer();
+        this.renderer = await this.rendererPromise;
+        this.rendererPromise = null;
+        return this.renderer;
+    },
+
+    async _createRenderer() {
+        widgetLog('info', 'Creating shared WebGL renderer');
+
+        const options = {
+            width: 512,
+            height: 640,
+            backgroundColor: 0x000000,
+            backgroundAlpha: 0,
+            resolution: 1,
+            autoDensity: false,
+            preferWebGLVersion: 2,
+            failIfMajorPerformanceCaveat: false,
+            // Don't create a canvas - each widget has its own
+            canvas: document.createElement('canvas')
+        };
+
+        if (isOffline) {
+            options.preference = 'webgpu';
+            options.preferWebGLVersion = 1;
+        }
+
+        const renderer = await PIXI.autoDetectRenderer(options);
+        widgetLog('info', `Shared renderer created (type: ${renderer.type})`);
+        return renderer;
+    },
+
+    // Queue a widget for initialization (sequential processing)
+    queueInit(widget) {
+        return new Promise((resolve, reject) => {
+            this.initQueue.push({ widget, resolve, reject });
+            this._processQueue();
+        });
+    },
+
+    async _processQueue() {
+        if (this.isProcessingQueue || this.initQueue.length === 0) return;
+
+        this.isProcessingQueue = true;
+
+        while (this.initQueue.length > 0) {
+            const { widget, resolve, reject } = this.initQueue.shift();
+            try {
+                await widget._doInit();
+                this.activeWidgets.add(widget);
+                resolve();
+            } catch (err) {
+                reject(err);
+            }
+            // Small delay between inits to let GPU settle
+            if (this.initQueue.length > 0) {
+                await new Promise(r => setTimeout(r, 50));
+            }
+        }
+
+        this.isProcessingQueue = false;
+    },
+
+    // Unregister a widget when it's destroyed
+    unregisterWidget(widget) {
+        this.activeWidgets.delete(widget);
+
+        // If no more widgets, we could destroy the renderer
+        // But keeping it around is fine - it's just one context
+        if (this.activeWidgets.size === 0) {
+            widgetLog('info', 'All widgets removed, shared renderer idle');
+        }
+    }
+};
+
 class GazeTracker extends HTMLElement {
     constructor() {
         super();
@@ -150,26 +249,52 @@ class GazeTracker extends HTMLElement {
                     display: block;
                 }
 
-                .loading {
+                .placeholder-img {
                     position: absolute;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    color: #888;
-                    font-family: system-ui, sans-serif;
-                    font-size: 14px;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    object-fit: contain;
+                    object-position: center;
+                    opacity: 1;
+                    transition: opacity 0.3s ease-out;
                 }
 
-                .error {
+                .placeholder-img.fade-out {
+                    opacity: 0;
+                    pointer-events: none;
+                }
+
+                .spinner-overlay {
                     position: absolute;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    color: #ff4444;
-                    font-family: system-ui, sans-serif;
-                    font-size: 14px;
-                    text-align: center;
-                    padding: 20px;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    background: rgba(0, 0, 0, 0.3);
+                    transition: opacity 0.3s ease-out;
+                }
+
+                .spinner-overlay.hidden {
+                    opacity: 0;
+                    pointer-events: none;
+                }
+
+                .spinner {
+                    width: 48px;
+                    height: 48px;
+                    border: 4px solid rgba(255, 255, 255, 0.3);
+                    border-top-color: #fff;
+                    border-radius: 50%;
+                    animation: spin 1s linear infinite;
+                }
+
+                @keyframes spin {
+                    to { transform: rotate(360deg); }
                 }
 
                 .controls {
@@ -257,13 +382,20 @@ class GazeTracker extends HTMLElement {
                 <button class="ctrl-btn fullscreen-btn" title="Toggle fullscreen">&#x26F6;</button>
             </div>
             <div class="gaze-container">
-                <div class="loading">Loading...</div>
+                <img class="placeholder-img" style="display: none;" alt="" />
+                <div class="spinner-overlay" style="display: none;">
+                    <div class="spinner"></div>
+                </div>
             </div>
         `;
     }
 
     async init() {
-        widgetLog('info', `init started (${this.isMobile ? 'mobile' : 'desktop'}, grid=${this.gridSize})`);
+        widgetLog('info', `init started (instance ${this.instanceId}, ${this.isMobile ? 'mobile' : 'desktop'}, grid=${this.gridSize})`);
+
+        // Try to show placeholder image immediately while we load
+        const src = this.getAttribute('src') || '/';
+        this._showPlaceholder(src);
 
         if (typeof PIXI === 'undefined') {
             widgetLog('info', 'loading PixiJS');
@@ -271,30 +403,97 @@ class GazeTracker extends HTMLElement {
             widgetLog('info', 'PixiJS loaded');
         }
 
+        // Queue initialization through the shared manager
+        // This ensures sequential init and shared renderer
+        try {
+            await GazeRendererManager.queueInit(this);
+        } catch (error) {
+            widgetLog('error', `init error: ${error.message}`);
+            console.error('Gaze Tracker init error:', error);
+            // Graceful degradation: just hide spinner and show static image
+            this._hideSpinnerOnly();
+        }
+    }
+
+    // Show input.jpg as placeholder while loading
+    _showPlaceholder(src) {
+        const placeholder = this.shadowRoot.querySelector('.placeholder-img');
+        const spinner = this.shadowRoot.querySelector('.spinner-overlay');
+        if (!placeholder) return;
+
+        const basePath = src.endsWith('/') ? src : src + '/';
+        // Try input.jpg first (in gaze_output), then parent dir
+        const possiblePaths = [
+            `${basePath}../input.jpg`,  // One level up from gaze_output
+            `${basePath}input.jpg`,
+        ];
+
+        // Try each path
+        const tryPath = (index) => {
+            if (index >= possiblePaths.length) {
+                // No placeholder found, show spinner without image
+                if (spinner) spinner.style.display = 'flex';
+                return;
+            }
+            const img = new Image();
+            img.onload = () => {
+                placeholder.src = possiblePaths[index];
+                placeholder.style.display = 'block';
+                if (spinner) spinner.style.display = 'flex';
+                widgetLog('info', `Placeholder loaded: ${possiblePaths[index]}`);
+            };
+            img.onerror = () => tryPath(index + 1);
+            img.src = possiblePaths[index];
+        };
+        tryPath(0);
+    }
+
+    // Hide spinner when canvas is ready, but keep placeholder behind as fallback
+    _hidePlaceholder() {
+        const spinner = this.shadowRoot.querySelector('.spinner-overlay');
+
+        if (spinner) {
+            spinner.classList.add('hidden');
+            setTimeout(() => spinner.remove(), 300);
+        }
+
+        // Keep placeholder image behind canvas as fallback - don't remove it
+    }
+
+    // Hide spinner but keep placeholder on error (graceful degradation)
+    _hideSpinnerOnly() {
+        const spinner = this.shadowRoot.querySelector('.spinner-overlay');
+        if (spinner) {
+            spinner.classList.add('hidden');
+            setTimeout(() => spinner.remove(), 300);
+        }
+        widgetLog('info', 'Graceful degradation: showing static image');
+    }
+
+    // Internal init called by the renderer manager (sequential)
+    async _doInit() {
         const container = this.shadowRoot.querySelector('.gaze-container');
-        const loading = this.shadowRoot.querySelector('.loading');
 
         try {
-            widgetLog('info', 'creating PIXI app');
+            // Get the shared renderer (creates if needed)
+            const sharedRenderer = await GazeRendererManager.getRenderer();
+            widgetLog('info', `Using shared renderer (instance ${this.instanceId})`);
+
+            // Create app with its own canvas but shared renderer resources
             this.app = new PIXI.Application();
-            // Start with a default size, will resize after loading sprites
-            const initOptions = {
+            await this.app.init({
                 width: 512,
                 height: 640,
                 backgroundColor: 0x000000,
                 backgroundAlpha: 0,
                 resolution: 1,
                 autoDensity: false,
-                // Prefer WebGL 2, but don't fail if we can't get it
+                // Use the shared renderer's context/settings
                 preferWebGLVersion: 2,
-                // Allow running even with performance warnings (context pressure)
-                failIfMajorPerformanceCaveat: false
-            };
-            if (isOffline) {
-                initOptions.preference = 'webgpu';  // Will fall back to webgl, then canvas
-                initOptions.preferWebGLVersion = 1; // Older WebGL might work better
-            }
-            await this.app.init(initOptions);
+                failIfMajorPerformanceCaveat: false,
+                // Share WebGL context via same preference
+                sharedTicker: false  // Each widget has its own animation loop
+            });
 
             // Handle WebGL context loss gracefully
             const canvas = this.app.canvas;
@@ -306,13 +505,12 @@ class GazeTracker extends HTMLElement {
             canvas.addEventListener('webglcontextrestored', () => {
                 widgetLog('info', `WebGL context restored (instance ${this.instanceId})`);
                 this.contextLost = false;
-                // Reload sprites to restore textures
                 const src = this.getAttribute('src') || '/';
                 this.loadSprite(src).catch(err => {
                     widgetLog('error', `Failed to restore after context loss: ${err.message}`);
                 });
             });
-            widgetLog('info', `PIXI app created (renderer: ${this.app.renderer.type})`);
+            widgetLog('info', `PIXI app created (instance ${this.instanceId}, renderer: ${this.app.renderer.type})`);
 
             // Load sprites - src is root path, default to "/" if not set
             const src = this.getAttribute('src') || '/';
@@ -320,11 +518,10 @@ class GazeTracker extends HTMLElement {
             await this.loadSprite(src);
             widgetLog('info', 'sprites loaded');
 
-            // Only remove loading indicator after successful sprite load
-            if (loading && loading.parentNode) {
-                loading.remove();
-            }
             container.appendChild(this.app.canvas);
+
+            // Fade out placeholder image now that canvas is ready
+            this._hidePlaceholder();
 
             widgetLog('info', 'setting up tracking');
             this.setupMouseTracking();
@@ -334,30 +531,24 @@ class GazeTracker extends HTMLElement {
             this.setupGyroButton();
             this.setupResizeObserver();
             this.isInitialized = true;
-            widgetLog('info', 'init complete');
+
+            // Force immediate render at center position (don't wait for mouse)
+            const centerPos = Math.floor(this.gridSize / 2);
+            this.currentCol = centerPos;
+            this.currentRow = centerPos;
+            this.targetCol = centerPos;
+            this.targetRow = centerPos;
+            this.updateFrame(centerPos, centerPos);
+
+            widgetLog('info', `init complete (instance ${this.instanceId})`);
 
         } catch (error) {
-            widgetLog('error', `init error: ${error.message}`);
+            widgetLog('error', `_doInit error: ${error.message}`);
             console.error('Gaze Tracker init error:', error);
-
-            // Check if this is a tainted canvas error (file:// protocol limitation)
-            let errorMessage = 'Failed to load: ' + error.message;
-            if (isOffline && (error.message.includes('Tainted') || error.message.includes('SecurityError'))) {
-                errorMessage = 'Cannot load from file://. Please run a local server:\n\nnpx serve\n\nThen open http://localhost:3000';
-            }
-
-            if (loading && loading.parentNode) {
-                loading.className = 'error';
-                loading.textContent = errorMessage;
-                loading.style.whiteSpace = 'pre-line';
-            } else {
-                // Loading element was removed, create error element
-                const errorEl = document.createElement('div');
-                errorEl.className = 'error';
-                errorEl.textContent = errorMessage;
-                errorEl.style.whiteSpace = 'pre-line';
-                container.appendChild(errorEl);
-            }
+            // Graceful degradation: hide spinner and show static placeholder
+            this._hideSpinnerOnly();
+            // Re-throw so the queue manager knows this widget failed
+            throw error;
         }
     }
 
@@ -629,10 +820,26 @@ class GazeTracker extends HTMLElement {
     setupMouseTracking() {
         this.mouseMoveHandler = (e) => {
             if (this.gyroEnabled) return;
-            const x = e.clientX / window.innerWidth;
-            const y = e.clientY / window.innerHeight;
-            this.targetCol = x * (this.gridSize - 1);
-            this.targetRow = y * (this.gridSize - 1);
+
+            // Get widget's position on screen
+            const rect = this.getBoundingClientRect();
+            const widgetCenterX = rect.left + rect.width / 2;
+            const widgetCenterY = rect.top + rect.height / 2;
+
+            // Calculate direction from widget center to mouse
+            const deltaX = e.clientX - widgetCenterX;
+            const deltaY = e.clientY - widgetCenterY;
+
+            // Normalize based on screen size (mouse at screen edge = max gaze)
+            // Use the larger dimension for consistent sensitivity
+            const maxDistance = Math.max(window.innerWidth, window.innerHeight) / 2;
+            const normalizedX = Math.max(-1, Math.min(1, deltaX / maxDistance));
+            const normalizedY = Math.max(-1, Math.min(1, deltaY / maxDistance));
+
+            // Map to grid coordinates (center = gridSize/2)
+            const center = (this.gridSize - 1) / 2;
+            this.targetCol = center + normalizedX * center;
+            this.targetRow = center + normalizedY * center;
         };
 
         document.addEventListener('mousemove', this.mouseMoveHandler);
@@ -641,17 +848,34 @@ class GazeTracker extends HTMLElement {
     setupTouchTracking() {
         // Use TWO-finger pan for gaze control on mobile
         // Single finger is reserved for page scrolling
+
+        // Helper to calculate gaze from touch position
+        const updateGazeFromTouch = (touchX, touchY) => {
+            const rect = this.getBoundingClientRect();
+            const widgetCenterX = rect.left + rect.width / 2;
+            const widgetCenterY = rect.top + rect.height / 2;
+
+            const deltaX = touchX - widgetCenterX;
+            const deltaY = touchY - widgetCenterY;
+
+            const maxDistance = Math.max(window.innerWidth, window.innerHeight) / 2;
+            const normalizedX = Math.max(-1, Math.min(1, deltaX / maxDistance));
+            const normalizedY = Math.max(-1, Math.min(1, deltaY / maxDistance));
+
+            const center = (this.gridSize - 1) / 2;
+            this.targetCol = center + normalizedX * center;
+            this.targetRow = center + normalizedY * center;
+        };
+
         this.touchStartHandler = (e) => {
             // Only activate with 2+ fingers to allow normal scrolling
             if (e.touches.length >= 2) {
                 this.isTouching = true;
-                // Use center point between first two touches
                 const t1 = e.touches[0];
                 const t2 = e.touches[1];
-                const x = ((t1.clientX + t2.clientX) / 2) / window.innerWidth;
-                const y = ((t1.clientY + t2.clientY) / 2) / window.innerHeight;
-                this.targetCol = x * (this.gridSize - 1);
-                this.targetRow = y * (this.gridSize - 1);
+                const touchX = (t1.clientX + t2.clientX) / 2;
+                const touchY = (t1.clientY + t2.clientY) / 2;
+                updateGazeFromTouch(touchX, touchY);
             }
         };
 
@@ -661,10 +885,9 @@ class GazeTracker extends HTMLElement {
                 this.isTouching = true;
                 const t1 = e.touches[0];
                 const t2 = e.touches[1];
-                const x = ((t1.clientX + t2.clientX) / 2) / window.innerWidth;
-                const y = ((t1.clientY + t2.clientY) / 2) / window.innerHeight;
-                this.targetCol = x * (this.gridSize - 1);
-                this.targetRow = y * (this.gridSize - 1);
+                const touchX = (t1.clientX + t2.clientX) / 2;
+                const touchY = (t1.clientY + t2.clientY) / 2;
+                updateGazeFromTouch(touchX, touchY);
             }
         };
 
@@ -870,6 +1093,9 @@ class GazeTracker extends HTMLElement {
     }
 
     cleanup() {
+        // Unregister from the shared manager
+        GazeRendererManager.unregisterWidget(this);
+
         if (this.mouseMoveHandler) {
             document.removeEventListener('mousemove', this.mouseMoveHandler);
         }
