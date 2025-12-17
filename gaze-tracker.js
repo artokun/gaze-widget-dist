@@ -299,8 +299,8 @@ class GazeTracker extends HTMLElement {
 
                 .controls {
                     position: absolute;
-                    top: 10px;
-                    right: 10px;
+                    top: 20px;
+                    right: 20px;
                     display: flex;
                     gap: 8px;
                     z-index: 100;
@@ -376,12 +376,25 @@ class GazeTracker extends HTMLElement {
                 :host(.mobile-fullscreen) .controls {
                     opacity: 1;
                 }
+
+                /* Container fullscreen (when custom element fullscreen fails) */
+                .gaze-container:fullscreen,
+                .gaze-container:-webkit-full-screen {
+                    background: #000;
+                    width: 100vw;
+                    height: 100vh;
+                }
+
+                .gaze-container:fullscreen .controls,
+                .gaze-container:-webkit-full-screen .controls {
+                    opacity: 1;
+                }
             </style>
-            <div class="controls">
-                <button class="ctrl-btn gyro-btn" title="Toggle gyroscope control">&#x1F4F1;</button>
-                <button class="ctrl-btn fullscreen-btn" title="Toggle fullscreen">&#x26F6;</button>
-            </div>
             <div class="gaze-container">
+                <div class="controls">
+                    <button class="ctrl-btn gyro-btn" title="Toggle gyroscope control">&#x1F4F1;</button>
+                    <button class="ctrl-btn fullscreen-btn" title="Toggle fullscreen">&#x26F6;</button>
+                </div>
                 <img class="placeholder-img" style="display: none;" alt="" />
                 <div class="spinner-overlay" style="display: none;">
                     <div class="spinner"></div>
@@ -472,7 +485,13 @@ class GazeTracker extends HTMLElement {
 
     // Internal init called by the renderer manager (sequential)
     async _doInit() {
-        const container = this.shadowRoot.querySelector('.gaze-container');
+        const container = this.shadowRoot?.querySelector('.gaze-container');
+
+        // Bail out early if element was removed from DOM during navigation
+        if (!container || !this.isConnected) {
+            widgetLog('info', `init aborted - element disconnected (instance ${this.instanceId})`);
+            return;
+        }
 
         try {
             // Get the shared renderer (creates if needed)
@@ -517,6 +536,13 @@ class GazeTracker extends HTMLElement {
             widgetLog('info', `loading sprites from: ${src}`);
             await this.loadSprite(src);
             widgetLog('info', 'sprites loaded');
+
+            // Check again after async operations - element may have been removed
+            if (!this.isConnected || !container.isConnected) {
+                widgetLog('info', `init aborted after sprite load - element disconnected (instance ${this.instanceId})`);
+                this.app?.destroy(true);
+                return;
+            }
 
             container.appendChild(this.app.canvas);
 
@@ -984,10 +1010,16 @@ class GazeTracker extends HTMLElement {
 
         // Update button icon based on fullscreen state
         const updateIcon = () => {
-            const isNativeFullscreen = document.fullscreenElement === this ||
-                                       document.webkitFullscreenElement === this;
+            const isNativeFullscreen = (document.fullscreenElement || document.webkitFullscreenElement) && this._isFullscreenSource;
             const isFullscreen = isNativeFullscreen || this.isMobileFullscreen;
             btn.innerHTML = isFullscreen ? '&#x2715;' : '&#x26F6;';
+
+            // Clean up if exited fullscreen externally (e.g., Escape key)
+            if (!document.fullscreenElement && !document.webkitFullscreenElement && this._isFullscreenSource) {
+                this._isFullscreenSource = false;
+                this.classList.remove('mobile-fullscreen');
+                document.body.style.overflow = '';
+            }
         };
 
         btn.addEventListener('click', () => {
@@ -995,8 +1027,7 @@ class GazeTracker extends HTMLElement {
             const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
             // Check various fullscreen states
-            const isNativeFullscreen = document.fullscreenElement === this ||
-                                       document.webkitFullscreenElement === this;
+            const isNativeFullscreen = (document.fullscreenElement || document.webkitFullscreenElement) && this._isFullscreenSource;
 
             if (this.isMobileFullscreen) {
                 // Exit CSS-based mobile fullscreen
@@ -1006,6 +1037,9 @@ class GazeTracker extends HTMLElement {
                 updateIcon();
             } else if (isNativeFullscreen) {
                 // Exit native fullscreen
+                this._isFullscreenSource = false;
+                this.classList.remove('mobile-fullscreen');
+                document.body.style.overflow = '';
                 if (document.exitFullscreen) {
                     document.exitFullscreen();
                 } else if (document.webkitExitFullscreen) {
@@ -1033,18 +1067,22 @@ class GazeTracker extends HTMLElement {
                     }, 100);
                 }
             } else {
-                // Desktop: Try native fullscreen API
-                if (this.requestFullscreen) {
-                    this.requestFullscreen().catch(err => {
-                        console.error('Fullscreen error:', err);
-                        // Fallback to CSS fullscreen
-                        this.isMobileFullscreen = true;
-                        this.classList.add('mobile-fullscreen');
-                        document.body.style.overflow = 'hidden';
+                // Desktop: Try native fullscreen API on documentElement (most reliable)
+                const docEl = document.documentElement;
+                const requestFS = docEl.requestFullscreen || docEl.webkitRequestFullscreen;
+
+                if (requestFS) {
+                    // Mark this widget as the one requesting fullscreen
+                    this._isFullscreenSource = true;
+                    this.classList.add('mobile-fullscreen');
+                    document.body.style.overflow = 'hidden';
+
+                    requestFS.call(docEl).catch(() => {
+                        // Native fullscreen failed (e.g., not a user gesture)
+                        // CSS fullscreen is already applied above as fallback
+                        this._isFullscreenSource = false;
                         updateIcon();
                     });
-                } else if (this.webkitRequestFullscreen) {
-                    this.webkitRequestFullscreen();
                 }
             }
         });
