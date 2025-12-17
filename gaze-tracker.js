@@ -1012,7 +1012,15 @@ class GazeTracker extends HTMLElement {
                     document.webkitExitFullscreen();
                 }
             } else if (isTouchDevice) {
-                // Mobile: Use CSS-based fullscreen (more reliable than Fullscreen API)
+                // Mobile: Navigate to /view/:sessionId for better fullscreen experience
+                const src = this.getAttribute('src') || '';
+                const sessionMatch = src.match(/\/uploads\/(session_[^/]+)/);
+                if (sessionMatch) {
+                    // Navigate to dedicated view page with gyro dialog
+                    window.location.href = `/view/${sessionMatch[1]}`;
+                    return;
+                }
+                // Fallback to CSS-based fullscreen if no sessionId (e.g., demo)
                 this.isMobileFullscreen = true;
                 this.classList.add('mobile-fullscreen');
                 document.body.style.overflow = 'hidden';
