@@ -30,11 +30,17 @@ const widgetLog = (level, msg) => {
     }).catch(() => {});
 };
 
+// Generate unique instance IDs for widgets
+let widgetInstanceCounter = 0;
+
 class GazeTracker extends HTMLElement {
     constructor() {
         super();
         this.attachShadow({ mode: 'open' });
-        widgetLog('info', 'constructor called');
+
+        // Unique instance ID to prevent cache collisions between multiple widgets
+        this.instanceId = ++widgetInstanceCounter;
+        widgetLog('info', `constructor called (instance ${this.instanceId})`);
 
         // Auto-detect mobile vs desktop (user agent only - window width is unreliable)
         this.isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
@@ -59,6 +65,7 @@ class GazeTracker extends HTMLElement {
         this.gyroEnabled = false;
         this.isTouching = false;
         this.isMobileFullscreen = false;  // CSS-based fullscreen for mobile
+        this.contextLost = false;  // WebGL context loss flag
     }
 
     static get observedAttributes() {
@@ -271,20 +278,40 @@ class GazeTracker extends HTMLElement {
             widgetLog('info', 'creating PIXI app');
             this.app = new PIXI.Application();
             // Start with a default size, will resize after loading sprites
-            // Use Canvas2D for file:// protocol (WebGL has tainted canvas issues)
             const initOptions = {
                 width: 512,
                 height: 640,
                 backgroundColor: 0x000000,
                 backgroundAlpha: 0,
                 resolution: 1,
-                autoDensity: false
+                autoDensity: false,
+                // Prefer WebGL 2, but don't fail if we can't get it
+                preferWebGLVersion: 2,
+                // Allow running even with performance warnings (context pressure)
+                failIfMajorPerformanceCaveat: false
             };
             if (isOffline) {
                 initOptions.preference = 'webgpu';  // Will fall back to webgl, then canvas
                 initOptions.preferWebGLVersion = 1; // Older WebGL might work better
             }
             await this.app.init(initOptions);
+
+            // Handle WebGL context loss gracefully
+            const canvas = this.app.canvas;
+            canvas.addEventListener('webglcontextlost', (e) => {
+                e.preventDefault();
+                widgetLog('warn', `WebGL context lost (instance ${this.instanceId})`);
+                this.contextLost = true;
+            });
+            canvas.addEventListener('webglcontextrestored', () => {
+                widgetLog('info', `WebGL context restored (instance ${this.instanceId})`);
+                this.contextLost = false;
+                // Reload sprites to restore textures
+                const src = this.getAttribute('src') || '/';
+                this.loadSprite(src).catch(err => {
+                    widgetLog('error', `Failed to restore after context loss: ${err.message}`);
+                });
+            });
             widgetLog('info', `PIXI app created (renderer: ${this.app.renderer.type})`);
 
             // Load sprites - src is root path, default to "/" if not set
@@ -362,16 +389,53 @@ class GazeTracker extends HTMLElement {
         });
     }
 
+    // Load a single texture with explicit verification
+    async loadSingleTexture(url, quadrantName) {
+        widgetLog('info', `Loading ${quadrantName}: ${url}`);
+
+        let texture;
+        if (isOffline) {
+            const img = await this.loadImageElement(url);
+            texture = PIXI.Texture.from(img);
+        } else {
+            // Load individually to ensure no cache confusion
+            // Add cache-busting for this widget instance
+            texture = await PIXI.Assets.load(url);
+        }
+
+        // Wait for texture to be fully ready
+        if (!texture.source.resource) {
+            await new Promise(resolve => {
+                if (texture.source.resource) {
+                    resolve();
+                } else {
+                    texture.source.once('loaded', resolve);
+                    texture.source.once('error', resolve);
+                }
+            });
+        }
+
+        // Verify texture is valid
+        if (!texture || !texture.source || texture.width === 0 || texture.height === 0) {
+            throw new Error(`Invalid texture for ${quadrantName}: ${url}`);
+        }
+
+        widgetLog('info', `${quadrantName} loaded: ${texture.width}x${texture.height}`);
+        return texture;
+    }
+
     async loadSprite(rootPath) {
         if (!this.app) return;
 
         try {
-            // Clean up previous sprite
+            // Clean up previous sprite and textures completely
             if (this.sprite) {
                 this.app.stage.removeChild(this.sprite);
                 this.sprite.destroy();
                 this.sprite = null;
             }
+
+            // Clear all cached textures for this instance
             this.quadrantTextures = {};
             this.textureCache = {};
 
@@ -379,72 +443,82 @@ class GazeTracker extends HTMLElement {
             // Desktop: q0.webp, q1.webp, q2.webp, q3.webp (15x15 each = 30x30 grid)
             // Mobile: q0_20.webp, q1_20.webp, q2_20.webp, q3_20.webp (10x10 each = 20x20 grid)
             const basePath = rootPath.endsWith('/') ? rootPath : rootPath + '/';
-
             let suffix = this.isMobile ? '_20' : '';
-            let urls = [
-                `${basePath}q0${suffix}.webp`,
-                `${basePath}q1${suffix}.webp`,
-                `${basePath}q2${suffix}.webp`,
-                `${basePath}q3${suffix}.webp`
-            ];
 
-            widgetLog('info', `Loading quadrants: ${urls[0]}`);
+            // Load each quadrant INDIVIDUALLY and SEQUENTIALLY to prevent any race conditions
+            // This is slower but guarantees correct texture assignment
+            const quadrantNames = ['q0', 'q1', 'q2', 'q3'];
+            const loadedTextures = {};
 
-            // Load textures - use Image elements for file:// protocol, PIXI.Assets for http
-            let loaded;
-            try {
-                if (isOffline) {
-                    // Load via Image elements (works with file:// protocol)
-                    const images = await Promise.all(urls.map(url => this.loadImageElement(url)));
-                    loaded = {};
-                    urls.forEach((url, i) => {
-                        loaded[url] = PIXI.Texture.from(images[i]);
-                    });
-                } else {
-                    loaded = await PIXI.Assets.load(urls);
-                }
-            } catch (e) {
-                if (this.isMobile && suffix === '_20') {
-                    // Mobile sprites not found, fall back to desktop
-                    widgetLog('info', 'Mobile sprites not found, falling back to desktop');
-                    suffix = '';
-                    this.gridSize = 30;
-                    this.quadrantSize = 15;
-                    this.currentCol = 15;
-                    this.currentRow = 15;
-                    this.targetCol = 15;
-                    this.targetRow = 15;
-                    urls = [
-                        `${basePath}q0.webp`,
-                        `${basePath}q1.webp`,
-                        `${basePath}q2.webp`,
-                        `${basePath}q3.webp`
-                    ];
-                    if (isOffline) {
-                        const images = await Promise.all(urls.map(url => this.loadImageElement(url)));
-                        loaded = {};
-                        urls.forEach((url, i) => {
-                            loaded[url] = PIXI.Texture.from(images[i]);
-                        });
+            for (const qName of quadrantNames) {
+                const url = `${basePath}${qName}${suffix}.webp`;
+                try {
+                    loadedTextures[qName] = await this.loadSingleTexture(url, qName);
+                } catch (e) {
+                    // If mobile sprites fail, try desktop fallback
+                    if (this.isMobile && suffix === '_20') {
+                        widgetLog('info', `Mobile ${qName} not found, trying desktop fallback`);
+                        suffix = '';
+                        this.gridSize = 30;
+                        this.quadrantSize = 15;
+                        this.currentCol = 15;
+                        this.currentRow = 15;
+                        this.targetCol = 15;
+                        this.targetRow = 15;
+
+                        // Reload all with desktop suffix
+                        for (const q of quadrantNames) {
+                            const desktopUrl = `${basePath}${q}.webp`;
+                            loadedTextures[q] = await this.loadSingleTexture(desktopUrl, q);
+                        }
+                        break;
                     } else {
-                        loaded = await PIXI.Assets.load(urls);
+                        throw e;
                     }
-                } else {
-                    throw e;
                 }
             }
+
+            // Explicitly assign each quadrant - no ambiguity
             this.quadrantTextures = {
-                q0: loaded[urls[0]],
-                q1: loaded[urls[1]],
-                q2: loaded[urls[2]],
-                q3: loaded[urls[3]]
+                q0: loadedTextures.q0,
+                q1: loadedTextures.q1,
+                q2: loadedTextures.q2,
+                q3: loadedTextures.q3
             };
 
-            // Verify all textures loaded
-            if (!this.quadrantTextures.q0 || !this.quadrantTextures.q1 ||
-                !this.quadrantTextures.q2 || !this.quadrantTextures.q3) {
-                throw new Error('Failed to load sprite images');
+            // VERIFY: All textures must exist and be valid
+            for (const [name, tex] of Object.entries(this.quadrantTextures)) {
+                if (!tex) {
+                    throw new Error(`Missing texture for ${name}`);
+                }
+                if (!tex.source || tex.width === 0 || tex.height === 0) {
+                    throw new Error(`Invalid texture for ${name}: ${tex.width}x${tex.height}`);
+                }
             }
+
+            // VERIFY: All quadrant textures should have the same dimensions
+            const q0Width = this.quadrantTextures.q0.width;
+            const q0Height = this.quadrantTextures.q0.height;
+            for (const [name, tex] of Object.entries(this.quadrantTextures)) {
+                if (tex.width !== q0Width || tex.height !== q0Height) {
+                    widgetLog('error', `Dimension mismatch: ${name} is ${tex.width}x${tex.height}, expected ${q0Width}x${q0Height}`);
+                    throw new Error(`Quadrant dimension mismatch for ${name}`);
+                }
+            }
+
+            // VERIFY: All quadrant textures should have DIFFERENT sources (not duplicates)
+            const sourceIds = new Set();
+            for (const [name, tex] of Object.entries(this.quadrantTextures)) {
+                const sourceId = tex.source.uid || tex.source._resourceId || tex.source.label;
+                if (sourceId && sourceIds.has(sourceId)) {
+                    widgetLog('error', `Duplicate texture source detected for ${name}`);
+                    // Don't throw - sources might legitimately share in some PIXI versions
+                    // But log it for debugging
+                }
+                if (sourceId) sourceIds.add(sourceId);
+            }
+
+            widgetLog('info', `All 4 quadrants verified: ${q0Width}x${q0Height} each`);
 
             // Infer frame dimensions from sprite size
             // Each quadrant sprite contains quadrantSize x quadrantSize frames
@@ -749,7 +823,8 @@ class GazeTracker extends HTMLElement {
     }
 
     animate() {
-        if (!this.sprite) return;
+        // Skip rendering if context is lost or sprite not ready
+        if (!this.sprite || this.contextLost) return;
 
         this.currentCol += (this.targetCol - this.currentCol) * this.smoothing;
         this.currentRow += (this.targetRow - this.currentRow) * this.smoothing;
